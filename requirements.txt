@@ -1,4 +1,5 @@
-spacy
+spacy>=3.7,<4.0
+en-core-web-sm>=3.7
 pdfplumber
 python-docx
 streamlit
