@@ -17,7 +17,7 @@ from reportlab.lib import colors
 # =====================================================
 st.set_page_config(page_title="JD Auto Extractor (spaCy)", layout="wide")
 
-nlp = spacy.load("en_core_web_sm")
+nlp = spacy.blank("en")
 
 # =====================================================
 # TEMPLATE DEFINITION
