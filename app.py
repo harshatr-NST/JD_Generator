@@ -22,7 +22,7 @@ st.set_page_config(page_title="JD Auto Extractor (spaCy)", layout="wide")
 nlp = spacy.blank("en")
 
 # Register Arial font (ensure arial.ttf is available in your system)
-pdfmetrics.registerFont(TTFont("Arial", "arial.ttf"))
+pdfmetrics.registerFont(TTFont("Arial", "Arial.ttf"))
 
 # =====================================================
 # TEMPLATE DEFINITION
