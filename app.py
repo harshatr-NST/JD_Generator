@@ -280,9 +280,14 @@ if "jd_data" in st.session_state:
 
     pdf_file = generate_template_pdf(edited_data)
 
+    # Create filename based on company name and designation
+    company_name = edited_data.get("company_name", "Company").replace(" ", "_")
+    designation = edited_data.get("designation", "Designation").replace(" ", "_")
+    pdf_filename = f"{company_name}-{designation}.pdf"
+
     st.download_button(
         "Download Completed Template (PDF)",
         pdf_file,
-        "Standard_JD_Template.pdf",
+        pdf_filename,
         "application/pdf"
     )
