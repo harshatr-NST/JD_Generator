@@ -3,10 +3,8 @@ import pdfplumber
 import docx
 import re
 import io
-
 import spacy
-from spacy.matcher import Matcher, PhraseMatcher
-
+from spacy.matcher import PhraseMatcher
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import A4
@@ -15,275 +13,192 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase import pdfmetrics
 
 # =====================================================
-# CONFIG
+# CONFIG & MODEL LOADING
 # =====================================================
-st.set_page_config(page_title="JD Auto Extractor (spaCy)", layout="wide")
+st.set_page_config(page_title="JD Auto Extractor Pro", layout="wide")
 
-nlp = spacy.blank("en")
+@st.cache_resource
+def load_nlp():
+    try:
+        # Try to load the small English model for better NER
+        return spacy.load("en_core_web_sm")
+    except:
+        # Fallback to blank if not installed
+        return spacy.blank("en")
 
-# Register Arial font (ensure arial.ttf is available in your system)
-pdfmetrics.registerFont(TTFont("Arial", "Arial.ttf"))
+nlp = load_nlp()
+
+# Register Font - Fallback to Helvetica if Arial is missing
+try:
+    pdfmetrics.registerFont(TTFont("Arial", "Arial.ttf"))
+    FONT_NAME = "Arial"
+except:
+    FONT_NAME = "Helvetica"
 
 # =====================================================
-# TEMPLATE DEFINITION
+# CONSTANTS
 # =====================================================
 TEMPLATE_FIELDS = [
-    "Company Name",
-    "Official Website",
-    "Preferred Education",
-    "Desired Experience",
-    "Designation",
-    "Stipend/month (part-time)",
-    "Stipend/month",
-    "Internship Duration",
-    "Roles & Responsibilities",
-    "Skills",
-    "Joining Location",
-    "Joining Month",
-    "No. of openings",
-    "Selection Process"
+    "Company Name", "Official Website", "Preferred Education",
+    "Desired Experience", "Designation", "Stipend/month",
+    "Internship Duration", "Roles & Responsibilities", "Skills",
+    "Joining Location", "No. of openings", "Selection Process"
 ]
 
-FIELD_KEYS = {
-    "Company Name": "company_name",
-    "Official Website": "official_website",
-    "Preferred Education": "preferred_education",
-    "Desired Experience": "desired_experience",
-    "Designation": "designation",
-    "Stipend/month (part-time)": "stipend_part_time",
-    "Stipend/month": "stipend",
-    "Internship Duration": "internship_duration",
-    "Roles & Responsibilities": "roles_responsibilities",
-    "Skills": "skills",
-    "Joining Location": "joining_location",
-    "Joining Month": "joining_month",
-    "No. of openings": "openings",
-    "Selection Process": "selection_process"
-}
+FIELD_KEYS = {label: label.lower().replace(" ", "_").replace("/", "_").replace("&_", "") for label in TEMPLATE_FIELDS}
+
+# Common skills for the PhraseMatcher to "catch" specifically
+SKILL_DB = [
+    "Python", "Java", "C++", "JavaScript", "React", "Angular", "Node.js", 
+    "SQL", "NoSQL", "AWS", "Azure", "Docker", "Kubernetes", "Machine Learning",
+    "Data Analysis", "Project Management", "Agile", "Excel", "Communication"
+]
 
 # =====================================================
-# FILE TEXT EXTRACTION
+# EXTRACTION LOGIC
 # =====================================================
-def extract_text_from_pdf(file):
-    text = ""
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            if page.extract_text():
-                text += page.extract_text() + "\n"
-    return text
 
-def extract_text_from_docx(file):
-    doc = docx.Document(file)
-    return "\n".join(p.text for p in doc.paragraphs)
+def clean_text(text):
+    """Fixes spacing and removes redundant newlines."""
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    return text.strip()
 
-# =====================================================
-# RULE-BASED NLP EXTRACTION
-# =====================================================
-def extract_structured_jd(text):
-    data = {v: "" for v in FIELD_KEYS.values()}
-    doc = nlp(text)
-
-    # -------------------------
-    # WEBSITE
-    # -------------------------
-    website = re.search(r"(https?://\S+)", text)
-    if website:
-        data["official_website"] = website.group(1)
-
-    # -------------------------
-    # STIPEND / SALARY
-    # -------------------------
-    stipend = re.search(r"(₹|\$)?\s?\d{3,6}\s?[-to]+\s?(₹|\$)?\s?\d{3,6}", text)
-    if stipend:
-        data["stipend"] = stipend.group(0)
-
-    # -------------------------
-    # DURATION
-    # -------------------------
-    duration = re.search(r"\d+\s?(months|month|weeks|week)", text, re.I)
-    if duration:
-        data["internship_duration"] = duration.group(0)
-
-    # -------------------------
-    # OPENINGS
-    # -------------------------
-    openings = re.search(r"(\d+)\s+(openings|positions|vacancies)", text, re.I)
-    if openings:
-        data["openings"] = openings.group(1)
-
-    # -------------------------
-    # LOCATION (spaCy NER)
-    # -------------------------
-    locations = [ent.text for ent in doc.ents if ent.label_ == "GPE"]
-    if locations:
-        data["joining_location"] = locations[0]
-
-    # -------------------------
-    # DESIGNATION (Heuristic)
-    # -------------------------
-    for line in text.splitlines():
-        match = re.search(r"(intern|engineer|developer|manager|analyst|consultant)", line, re.I)
+def extract_skills(doc, text):
+    """Hybrid approach: Regex sections + Phrase Matching + NER."""
+    # 1. Regex Section Extraction
+    skill_patterns = [
+        r"(?i)(?:Skills|Requirements|Key Skills|What you need|Technical Stack)[:\-\n]+(.*?)(?=\n\n|\n[A-Z]{3,}|\Z)",
+    ]
+    extracted_text = ""
+    for p in skill_patterns:
+        match = re.search(p, text, re.S)
         if match:
-            designation = re.sub(r"(?i)Designation\s*[:\-]?\s*", "", line).strip()
-            data["designation"] = designation
+            extracted_text = match.group(1).strip()
             break
 
-    # -------------------------
-    # EDUCATION / EXPERIENCE
-    # -------------------------
-    education = re.search(r"(B\.?Tech|M\.?Tech|Bachelor|Master|Degree)", text, re.I)
-    if education:
-        data["preferred_education"] = education.group(0)
+    # 2. Phrase Matching (catching specific keywords)
+    matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
+    patterns = [nlp.make_doc(text) for text in SKILL_DB]
+    matcher.add("SKILL_LIST", patterns)
+    
+    matches = matcher(doc)
+    found_entities = set([doc[start:end].text for _, start, end in matches])
+    
+    # 3. Add Entities (catching things like 'Oracle' or 'Google Cloud' via NER)
+    for ent in doc.ents:
+        if ent.label_ in ["ORG", "PRODUCT"] and len(ent.text) < 20:
+            found_entities.add(ent.text)
 
-    experience = re.search(r"\d+\+?\s+years?\s+experience", text, re.I)
-    if experience:
-        data["desired_experience"] = experience.group(0)
+    # Combine
+    if extracted_text:
+        return extracted_text
+    return ", ".join(list(found_entities)) if found_entities else "Not found"
 
-    # -------------------------
-    # SECTION EXTRACTION
-    # -------------------------
-    def extract_section(header_keywords):
-        pattern = r"(?i)(" + "|".join(header_keywords) + r")\s*[:\-]?\s*(.*?)(?=\n[A-Z][^\n]{0,40}:|\Z)"
-        match = re.search(pattern, text, re.S)
-        return match.group(2).strip() if match else ""
+def extract_structured_jd(text):
+    text = clean_text(text)
+    doc = nlp(text)
+    data = {v: "" for v in FIELD_KEYS.values()}
 
-    data["roles_responsibilities"] = extract_section(
-        ["Roles", "Responsibilities", "What you will do"]
-    )
+    # Website
+    web = re.search(r"(https?://[^\s,]+)", text)
+    data["official_website"] = web.group(1) if web else ""
 
-    data["skills"] = extract_section(
-        ["Skills", "Requirements", "Qualifications"]
-    )
+    # Stipend
+    stipend = re.search(r"(?:Rs\.?|INR|₹|\$)\s?\d{3,6}(?:\s?-\s?(?:Rs\.?|INR|₹|\$)?\s?\d{3,6})?", text)
+    data["stipend_month"] = stipend.group(0) if stipend else ""
 
-    data["selection_process"] = extract_section(
-        ["Selection Process", "Interview Process", "Hiring Process"]
-    )
+    # Duration
+    dur = re.search(r"\d+\s?(?:months|month|weeks|week)", text, re.I)
+    data["internship_duration"] = dur.group(0) if dur else ""
+
+    # Designation
+    for line in text.splitlines()[:10]: # Check first 10 lines
+        if any(kw in line.lower() for kw in ["intern", "engineer", "developer", "manager", "analyst"]):
+            data["designation"] = line.strip()
+            break
+
+    # Location
+    locs = [ent.text for ent in doc.ents if ent.label_ == "GPE"]
+    data["joining_location"] = locs[0] if locs else ""
+
+    # Skills (The Improved Function)
+    data["skills"] = extract_skills(doc, text)
+
+    # Roles & Responsibilities
+    roles = re.search(r"(?i)(?:Responsibilities|Roles|What you will do)[:\-\n]+(.*?)(?=\n\n|\n[A-Z]{3,}|\Z)", text, re.S)
+    data["roles_responsibilities"] = roles.group(1).strip() if roles else ""
 
     return data
 
 # =====================================================
-# PDF GENERATION WITH WRAPPING
+# PDF GENERATION
 # =====================================================
 def generate_template_pdf(data):
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4,
-                            rightMargin=30, leftMargin=30,
-                            topMargin=30, bottomMargin=30)
-
-    # Paragraph style (Arial, size 8, wrap text)
-    style_left = ParagraphStyle(
-        name='LeftCol',
-        fontName='Arial',
-        fontSize=8,
-        textColor=colors.white,  # Text color only
-        leftIndent=0,
-        rightIndent=0,
-        spaceAfter=2,
-        spaceBefore=2
-    )
-
-    style_right = ParagraphStyle(
-        name='RightCol',
-        fontName='Arial',
-        fontSize=8,
-        textColor=colors.black,
-        leftIndent=0,
-        rightIndent=0,
-        spaceAfter=2,
-        spaceBefore=2
-    )
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+    
+    styles = getSampleStyleSheet()
+    style_left = ParagraphStyle('Left', fontName=FONT_NAME, fontSize=9, textColor=colors.white)
+    style_right = ParagraphStyle('Right', fontName=FONT_NAME, fontSize=9, textColor=colors.black, leading=12)
 
     table_data = []
-
     for label in TEMPLATE_FIELDS:
         key = FIELD_KEYS[label]
-        table_data.append([
-            Paragraph(label, style_left),
-            Paragraph(data.get(key, "").replace("\n", "<br/>"), style_right)
-        ])
+        val = str(data.get(key, "")).replace("\n", "<br/>")
+        table_data.append([Paragraph(label, style_left), Paragraph(val, style_right)])
 
-    table = Table(table_data, colWidths=[170, 330], repeatRows=0)
-    
-    table_style = TableStyle([
-        # Table border
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#a3a3a3")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        
-        # Column 1 cell background (fills entire cell)
-        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#2e74b5")),
-        ("TEXTCOLOR", (0, 0), (0, -1), colors.white),
-        ("FONTNAME", (0, 0), (0, -1), "Arial"),
-        ("FONTSIZE", (0, 0), (0, -1), 8),
-        
-        # Column 2 cell background
-        ("BACKGROUND", (1, 0), (1, -1), colors.white),
-        ("TEXTCOLOR", (1, 0), (1, -1), colors.black),
-        ("FONTNAME", (1, 0), (1, -1), "Arial"),
-        ("FONTSIZE", (1, 0), (1, -1), 8),
-    ])
-
-    table.setStyle(table_style)
+    table = Table(table_data, colWidths=[150, 350])
+    table.setStyle(TableStyle([
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#2e74b5")),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('PADDING', (0, 0), (-1, -1), 8),
+    ]))
 
     doc.build([table])
     buffer.seek(0)
     return buffer
 
-
 # =====================================================
-# STREAMLIT UI
+# MAIN APP
 # =====================================================
-st.title("JD Auto-Extraction Tool (spaCy – Open Source)")
+def main():
+    st.title("📄 JD Template Auto-Extractor")
+    st.markdown("Upload a Job Description and this tool will attempt to format it into your standard template.")
 
-uploaded_file = st.file_uploader(
-    "Upload Job Description (TXT, PDF, DOCX)",
-    type=["txt", "pdf", "docx"]
-)
+    uploaded_file = st.file_uploader("Upload JD (PDF, DOCX, TXT)", type=["pdf", "docx", "txt"])
+    
+    if uploaded_file:
+        if uploaded_file.type == "application/pdf":
+            with pdfplumber.open(uploaded_file) as pdf:
+                raw_text = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
+        elif uploaded_file.type.endswith("wordprocessingml.document"):
+            raw_text = "\n".join([p.text for p in docx.Document(uploaded_file).paragraphs])
+        else:
+            raw_text = uploaded_file.read().decode("utf-8")
 
-raw_text = ""
-
-if uploaded_file:
-    if uploaded_file.type == "text/plain":
-        raw_text = uploaded_file.read().decode("utf-8")
-    elif uploaded_file.type == "application/pdf":
-        raw_text = extract_text_from_pdf(uploaded_file)
-    elif uploaded_file.type.endswith("wordprocessingml.document"):
-        raw_text = extract_text_from_docx(uploaded_file)
-
-    st.subheader("Extracted Raw Text")
-    st.text_area("", raw_text, height=250)
-
-    if st.button("Extract to Template"):
-        with st.spinner("Extracting using NLP rules..."):
+        if st.button("✨ Extract Data"):
             st.session_state["jd_data"] = extract_structured_jd(raw_text)
 
-if "jd_data" in st.session_state:
-    st.subheader("Editable Standard Template")
+    if "jd_data" in st.session_state:
+        st.divider()
+        col1, col2 = st.columns([1, 1])
+        
+        edited_data = {}
+        with col1:
+            st.subheader("Edit Extracted Information")
+            for label in TEMPLATE_FIELDS:
+                key = FIELD_KEYS[label]
+                if len(st.session_state["jd_data"].get(key, "")) > 50:
+                    edited_data[key] = st.text_area(label, st.session_state["jd_data"].get(key, ""), height=150)
+                else:
+                    edited_data[key] = st.text_input(label, st.session_state["jd_data"].get(key, ""))
 
-    edited_data = {}
+        with col2:
+            st.subheader("Preview & Export")
+            pdf_out = generate_template_pdf(edited_data)
+            st.download_button("📥 Download PDF Template", pdf_out, "JD_Standard.pdf", "application/pdf")
+            st.info("Review the fields on the left before downloading. Some complex JDs may require manual cleanup.")
 
-    for label in TEMPLATE_FIELDS:
-        key = FIELD_KEYS[label]
-        if label in ["Roles & Responsibilities", "Skills", "Selection Process"]:
-            edited_data[key] = st.text_area(
-                label,
-                st.session_state["jd_data"].get(key, ""),
-                height=120
-            )
-        else:
-            edited_data[key] = st.text_input(
-                label,
-                st.session_state["jd_data"].get(key, "")
-            )
-
-    pdf_file = generate_template_pdf(edited_data)
-
-    st.download_button(
-        "Download Completed Template (PDF)",
-        pdf_file,
-        "Standard_JD_Template.pdf",
-        "application/pdf"
-    )
+if __name__ == "__main__":
+    main()
