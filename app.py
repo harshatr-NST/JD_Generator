@@ -8,9 +8,11 @@ import spacy
 from spacy.matcher import Matcher, PhraseMatcher
 
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase import pdfmetrics
 
 # =====================================================
 # CONFIG
@@ -18,6 +20,9 @@ from reportlab.lib import colors
 st.set_page_config(page_title="JD Auto Extractor (spaCy)", layout="wide")
 
 nlp = spacy.blank("en")
+
+# Register Arial font (ensure arial.ttf is available in your system)
+pdfmetrics.registerFont(TTFont("Arial", "arial.ttf"))
 
 # =====================================================
 # TEMPLATE DEFINITION
@@ -67,11 +72,9 @@ def extract_text_from_pdf(file):
                 text += page.extract_text() + "\n"
     return text
 
-
 def extract_text_from_docx(file):
     doc = docx.Document(file)
     return "\n".join(p.text for p in doc.paragraphs)
-
 
 # =====================================================
 # RULE-BASED NLP EXTRACTION
@@ -119,8 +122,10 @@ def extract_structured_jd(text):
     # DESIGNATION (Heuristic)
     # -------------------------
     for line in text.splitlines():
-        if re.search(r"(intern|engineer|developer|manager)", line, re.I):
-            data["designation"] = line.strip()
+        match = re.search(r"(intern|engineer|developer|manager|analyst|consultant)", line, re.I)
+        if match:
+            designation = re.sub(r"(?i)Designation\s*[:\-]?\s*", "", line).strip()
+            data["designation"] = designation
             break
 
     # -------------------------
@@ -156,9 +161,8 @@ def extract_structured_jd(text):
 
     return data
 
-
 # =====================================================
-# PDF GENERATION
+# PDF GENERATION WITH WRAPPING
 # =====================================================
 def generate_template_pdf(data):
     buffer = io.BytesIO()
@@ -166,21 +170,43 @@ def generate_template_pdf(data):
                             rightMargin=30, leftMargin=30,
                             topMargin=30, bottomMargin=30)
 
-    styles = getSampleStyleSheet()
-    normal = styles["Normal"]
+    # Paragraph style with Arial, size 8
+    style_left = ParagraphStyle(
+        name='LeftCol',
+        fontName='Arial',
+        fontSize=8,
+        textColor=colors.white,
+        backColor=colors.HexColor("#2e74b5"),
+        leftIndent=0,
+        rightIndent=0,
+        spaceAfter=2,
+        spaceBefore=2
+    )
+
+    style_right = ParagraphStyle(
+        name='RightCol',
+        fontName='Arial',
+        fontSize=8,
+        textColor=colors.black,
+        backColor=colors.white,
+        leftIndent=0,
+        rightIndent=0,
+        spaceAfter=2,
+        spaceBefore=2
+    )
 
     table_data = []
 
     for label in TEMPLATE_FIELDS:
         key = FIELD_KEYS[label]
         table_data.append([
-            Paragraph(label, normal),
-            Paragraph(data.get(key, "").replace("\n", "<br/>"), normal)
+            Paragraph(label, style_left),
+            Paragraph(data.get(key, "").replace("\n", "<br/>"), style_right)
         ])
 
-    table = Table(table_data, colWidths=[170, 330])
+    table = Table(table_data, colWidths=[170, 330], repeatRows=0)
     table.setStyle(TableStyle([
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#a3a3a3")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 6),
         ("RIGHTPADDING", (0, 0), (-1, -1), 6),
@@ -191,7 +217,6 @@ def generate_template_pdf(data):
     doc.build([table])
     buffer.seek(0)
     return buffer
-
 
 # =====================================================
 # STREAMLIT UI
@@ -219,7 +244,6 @@ if uploaded_file:
     if st.button("Extract to Template"):
         with st.spinner("Extracting using NLP rules..."):
             st.session_state["jd_data"] = extract_structured_jd(raw_text)
-
 
 if "jd_data" in st.session_state:
     st.subheader("Editable Standard Template")
