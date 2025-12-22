@@ -13,22 +13,20 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase import pdfmetrics
 
 # =====================================================
-# CONFIG & MODEL LOADING
+# CONFIG & MODEL
 # =====================================================
-st.set_page_config(page_title="JD Auto Extractor Pro", layout="wide")
+st.set_page_config(page_title="JD Pro Extractor", layout="wide")
 
 @st.cache_resource
 def load_nlp():
     try:
-        # Try to load the small English model for better NER
         return spacy.load("en_core_web_sm")
     except:
-        # Fallback to blank if not installed
         return spacy.blank("en")
 
 nlp = load_nlp()
 
-# Register Font - Fallback to Helvetica if Arial is missing
+# Font handling for different environments
 try:
     pdfmetrics.registerFont(TTFont("Arial", "Arial.ttf"))
     FONT_NAME = "Arial"
@@ -36,97 +34,74 @@ except:
     FONT_NAME = "Helvetica"
 
 # =====================================================
-# CONSTANTS
-# =====================================================
-TEMPLATE_FIELDS = [
-    "Company Name", "Official Website", "Preferred Education",
-    "Desired Experience", "Designation", "Stipend/month",
-    "Internship Duration", "Roles & Responsibilities", "Skills",
-    "Joining Location", "No. of openings", "Selection Process"
-]
-
-FIELD_KEYS = {label: label.lower().replace(" ", "_").replace("/", "_").replace("&_", "") for label in TEMPLATE_FIELDS}
-
-# Common skills for the PhraseMatcher to "catch" specifically
-SKILL_DB = [
-    "Python", "Java", "C++", "JavaScript", "React", "Angular", "Node.js", 
-    "SQL", "NoSQL", "AWS", "Azure", "Docker", "Kubernetes", "Machine Learning",
-    "Data Analysis", "Project Management", "Agile", "Excel", "Communication"
-]
-
-# =====================================================
-# EXTRACTION LOGIC
+# EXTRACTION ENGINE (REBUILT FOR ACCURACY)
 # =====================================================
 
-def clean_text(text):
-    """Fixes spacing and removes redundant newlines."""
-    text = re.sub(r'\n\s*\n', '\n\n', text)
-    return text.strip()
-
-def extract_skills(doc, text):
-    """Hybrid approach: Regex sections + Phrase Matching + NER."""
-    # 1. Regex Section Extraction
-    skill_patterns = [
-        r"(?i)(?:Skills|Requirements|Key Skills|What you need|Technical Stack)[:\-\n]+(.*?)(?=\n\n|\n[A-Z]{3,}|\Z)",
-    ]
-    extracted_text = ""
-    for p in skill_patterns:
-        match = re.search(p, text, re.S)
-        if match:
-            extracted_text = match.group(1).strip()
+def get_content_block(text, keywords, next_section_keywords):
+    """
+    Finds a section by looking for keywords, and captures 
+    until it hits a known 'next' section header.
+    """
+    lines = text.splitlines()
+    start_idx = -1
+    
+    # 1. Find the starting line
+    for i, line in enumerate(lines):
+        if any(re.search(rf"\b{kw}\b", line, re.I) for kw in keywords):
+            start_idx = i
             break
-
-    # 2. Phrase Matching (catching specific keywords)
-    matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
-    patterns = [nlp.make_doc(text) for text in SKILL_DB]
-    matcher.add("SKILL_LIST", patterns)
     
-    matches = matcher(doc)
-    found_entities = set([doc[start:end].text for _, start, end in matches])
-    
-    # 3. Add Entities (catching things like 'Oracle' or 'Google Cloud' via NER)
-    for ent in doc.ents:
-        if ent.label_ in ["ORG", "PRODUCT"] and len(ent.text) < 20:
-            found_entities.add(ent.text)
+    if start_idx == -1: return ""
 
-    # Combine
-    if extracted_text:
-        return extracted_text
-    return ", ".join(list(found_entities)) if found_entities else "Not found"
+    # 2. Find the end line (look for the next major header)
+    end_idx = len(lines)
+    for j in range(start_idx + 1, len(lines)):
+        # If line is short and contains 'next section' keywords, stop there
+        if len(lines[j].strip()) < 40 and any(re.search(rf"\b{kw}\b", lines[j], re.I) for kw in next_section_keywords):
+            end_idx = j
+            break
+            
+    content = "\n".join(lines[start_idx+1 : end_idx]).strip()
+    # Clean up artifacts like leading colons or dashes
+    return re.sub(r'^[:\-\s•]+', '', content, flags=re.M)
 
 def extract_structured_jd(text):
-    text = clean_text(text)
-    doc = nlp(text)
-    data = {v: "" for v in FIELD_KEYS.values()}
+    # Dictionary of headers to help the logic know when to "stop" one section and "start" another
+    headers = {
+        "skills": ["Skills", "Requirements", "Qualifications", "Competencies", "Tech Stack"],
+        "roles": ["Responsibilities", "Role", "What you will do", "Job Description", "Expectations"],
+        "process": ["Selection Process", "Interview", "Hiring", "Hiring Workflow"],
+        "edu": ["Education", "Degree", "Academic"]
+    }
+    
+    # Flat list of all headers to use as "stop" markers
+    all_headers = [item for sublist in headers.values() for item in sublist]
 
-    # Website
+    doc = nlp(text)
+    data = {}
+
+    # --- Basic Fields (Regex is fine for these) ---
     web = re.search(r"(https?://[^\s,]+)", text)
     data["official_website"] = web.group(1) if web else ""
-
-    # Stipend
+    
     stipend = re.search(r"(?:Rs\.?|INR|₹|\$)\s?\d{3,6}(?:\s?-\s?(?:Rs\.?|INR|₹|\$)?\s?\d{3,6})?", text)
-    data["stipend_month"] = stipend.group(0) if stipend else ""
+    data["stipend"] = stipend.group(0) if stipend else ""
 
-    # Duration
-    dur = re.search(r"\d+\s?(?:months|month|weeks|week)", text, re.I)
-    data["internship_duration"] = dur.group(0) if dur else ""
-
-    # Designation
-    for line in text.splitlines()[:10]: # Check first 10 lines
-        if any(kw in line.lower() for kw in ["intern", "engineer", "developer", "manager", "analyst"]):
-            data["designation"] = line.strip()
-            break
-
-    # Location
+    # --- Large Block Fields (Block-Logic) ---
+    data["skills"] = get_content_block(text, headers["skills"], all_headers)
+    data["roles_responsibilities"] = get_content_block(text, headers["roles"], all_headers)
+    data["selection_process"] = get_content_block(text, headers["process"], all_headers)
+    
+    # --- Heuristic Fields ---
+    data["preferred_education"] = get_content_block(text, headers["edu"], all_headers)[:200] # Cap length
+    
+    # Extract Location via NER
     locs = [ent.text for ent in doc.ents if ent.label_ == "GPE"]
     data["joining_location"] = locs[0] if locs else ""
 
-    # Skills (The Improved Function)
-    data["skills"] = extract_skills(doc, text)
-
-    # Roles & Responsibilities
-    roles = re.search(r"(?i)(?:Responsibilities|Roles|What you will do)[:\-\n]+(.*?)(?=\n\n|\n[A-Z]{3,}|\Z)", text, re.S)
-    data["roles_responsibilities"] = roles.group(1).strip() if roles else ""
+    # Designation: Usually in the first 5 lines
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    data["designation"] = lines[0] if lines else ""
 
     return data
 
@@ -135,24 +110,36 @@ def extract_structured_jd(text):
 # =====================================================
 def generate_template_pdf(data):
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
-    
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
     styles = getSampleStyleSheet()
-    style_left = ParagraphStyle('Left', fontName=FONT_NAME, fontSize=9, textColor=colors.white)
-    style_right = ParagraphStyle('Right', fontName=FONT_NAME, fontSize=9, textColor=colors.black, leading=12)
+    
+    style_label = ParagraphStyle('Label', fontName=FONT_NAME, fontSize=10, textColor=colors.white, leading=14)
+    style_val = ParagraphStyle('Value', fontName=FONT_NAME, fontSize=10, textColor=colors.black, leading=14)
+
+    # Mapping internal keys back to Display Labels
+    display_map = [
+        ("Designation", "designation"),
+        ("Official Website", "official_website"),
+        ("Preferred Education", "preferred_education"),
+        ("Stipend", "stipend"),
+        ("Skills", "skills"),
+        ("Roles & Responsibilities", "roles_responsibilities"),
+        ("Joining Location", "joining_location"),
+        ("Selection Process", "selection_process")
+    ]
 
     table_data = []
-    for label in TEMPLATE_FIELDS:
-        key = FIELD_KEYS[label]
-        val = str(data.get(key, "")).replace("\n", "<br/>")
-        table_data.append([Paragraph(label, style_left), Paragraph(val, style_right)])
+    for label, key in display_map:
+        val = data.get(key, "N/A")
+        if not val: val = "N/A"
+        table_data.append([Paragraph(label, style_label), Paragraph(val.replace("\n", "<br/>"), style_val)])
 
-    table = Table(table_data, colWidths=[150, 350])
+    table = Table(table_data, colWidths=[140, 380])
     table.setStyle(TableStyle([
         ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
         ('BACKGROUND', (0, 0), (0, -1), colors.HexColor("#2e74b5")),
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('PADDING', (0, 0), (-1, -1), 8),
+        ('PADDING', (0, 0), (-1, -1), 10),
     ]))
 
     doc.build([table])
@@ -160,45 +147,41 @@ def generate_template_pdf(data):
     return buffer
 
 # =====================================================
-# MAIN APP
+# UI
 # =====================================================
-def main():
-    st.title("📄 JD Template Auto-Extractor")
-    st.markdown("Upload a Job Description and this tool will attempt to format it into your standard template.")
+st.title("🚀 Precision JD Extractor")
 
-    uploaded_file = st.file_uploader("Upload JD (PDF, DOCX, TXT)", type=["pdf", "docx", "txt"])
+uploaded_file = st.file_uploader("Upload JD", type=["pdf", "docx", "txt"])
+
+if uploaded_file:
+    # Text Extraction
+    if uploaded_file.type == "application/pdf":
+        with pdfplumber.open(uploaded_file) as pdf:
+            raw_text = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
+    elif uploaded_file.type.endswith("wordprocessingml.document"):
+        raw_text = "\n".join([p.text for p in docx.Document(uploaded_file).paragraphs])
+    else:
+        raw_text = uploaded_file.read().decode("utf-8")
+
+    if st.button("Extract Content"):
+        with st.spinner("Analyzing document structure..."):
+            st.session_state["extracted"] = extract_structured_jd(raw_text)
+
+if "extracted" in st.session_state:
+    st.subheader("Verify & Edit Extracted Data")
     
-    if uploaded_file:
-        if uploaded_file.type == "application/pdf":
-            with pdfplumber.open(uploaded_file) as pdf:
-                raw_text = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
-        elif uploaded_file.type.endswith("wordprocessingml.document"):
-            raw_text = "\n".join([p.text for p in docx.Document(uploaded_file).paragraphs])
-        else:
-            raw_text = uploaded_file.read().decode("utf-8")
+    updated_data = {}
+    col1, col2 = st.columns(2)
+    
+    # Split fields for UI
+    fields = list(st.session_state["extracted"].keys())
+    for i, key in enumerate(fields):
+        with (col1 if i % 2 == 0 else col2):
+            val = st.session_state["extracted"][key]
+            if len(val) > 100:
+                updated_data[key] = st.text_area(key.replace("_", " ").title(), val, height=200)
+            else:
+                updated_data[key] = st.text_input(key.replace("_", " ").title(), val)
 
-        if st.button("✨ Extract Data"):
-            st.session_state["jd_data"] = extract_structured_jd(raw_text)
-
-    if "jd_data" in st.session_state:
-        st.divider()
-        col1, col2 = st.columns([1, 1])
-        
-        edited_data = {}
-        with col1:
-            st.subheader("Edit Extracted Information")
-            for label in TEMPLATE_FIELDS:
-                key = FIELD_KEYS[label]
-                if len(st.session_state["jd_data"].get(key, "")) > 50:
-                    edited_data[key] = st.text_area(label, st.session_state["jd_data"].get(key, ""), height=150)
-                else:
-                    edited_data[key] = st.text_input(label, st.session_state["jd_data"].get(key, ""))
-
-        with col2:
-            st.subheader("Preview & Export")
-            pdf_out = generate_template_pdf(edited_data)
-            st.download_button("📥 Download PDF Template", pdf_out, "JD_Standard.pdf", "application/pdf")
-            st.info("Review the fields on the left before downloading. Some complex JDs may require manual cleanup.")
-
-if __name__ == "__main__":
-    main()
+    pdf_file = generate_template_pdf(updated_data)
+    st.download_button("Download Standardized PDF", pdf_file, "Processed_JD.pdf", "application/pdf")
