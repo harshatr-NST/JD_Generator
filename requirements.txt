@@ -1,2 +1,5 @@
-pip install spacy pdfplumber python-docx streamlit reportlab
-python -m spacy download en_core_web_sm
+spacy
+pdfplumber
+python-docx
+streamlit
+reportlab
