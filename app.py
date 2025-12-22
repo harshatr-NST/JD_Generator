@@ -17,7 +17,7 @@ from reportlab.pdfbase import pdfmetrics
 # =====================================================
 # CONFIG
 # =====================================================
-st.set_page_config(page_title="JD Auto Extractor (spaCy)", layout="wide")
+st.set_page_config(page_title="JD Generator", layout="wide")
 
 nlp = spacy.blank("en")
 
@@ -235,7 +235,7 @@ def generate_template_pdf(data):
 # =====================================================
 # STREAMLIT UI
 # =====================================================
-st.title("JD Auto-Extraction Tool (spaCy – Open Source)")
+st.title("JD Generator")
 
 uploaded_file = st.file_uploader(
     "Upload Job Description (TXT, PDF, DOCX)",
