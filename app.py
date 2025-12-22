@@ -86,30 +86,51 @@ def extract_structured_jd(text):
     # -------------------------
     # WEBSITE
     # -------------------------
-    website = re.search(r"(https?://\S+)", text)
+    website = re.search(r"(https?://[^\s]+|www\.[^\s]+)", text)
     if website:
-        data["official_website"] = website.group(1)
+        data["official_website"] = website.group(0)
 
     # -------------------------
     # STIPEND / SALARY
     # -------------------------
-    stipend = re.search(r"(₹|\$)?\s?\d{3,6}\s?[-to]+\s?(₹|\$)?\s?\d{3,6}", text)
+    stipend = re.search(
+        r"(₹|\$|€)?\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\s?(?:-|to|–)\s?(₹|\$|€)?\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\s?(?:per month|pm|monthly|/month|/mo|per annum|pa|annually|/year|/yr)?",
+        text,
+        re.I
+    )
     if stipend:
         data["stipend"] = stipend.group(0)
+
+    # Part-time stipend
+    stipend_part_time = re.search(
+        r"(₹|\$|€)?\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\s?(?:per month|pm|monthly|/month|/mo)\s?(?:part[- ]time|parttime)",
+        text,
+        re.I
+    )
+    if stipend_part_time:
+        data["stipend_part_time"] = stipend_part_time.group(0)
 
     # -------------------------
     # DURATION
     # -------------------------
-    duration = re.search(r"\d+\s?(months|month|weeks|week)", text, re.I)
+    duration = re.search(
+        r"\b\d+\s?(?:-|to|–)\s?\d+\s?(?:months?|weeks?|days?|years?|mos?|wks?|yrs?)\b|\b\d+\s?(?:months?|weeks?|days?|years?|mos?|wks?|yrs?)\b",
+        text,
+        re.I
+    )
     if duration:
         data["internship_duration"] = duration.group(0)
 
     # -------------------------
     # OPENINGS
     # -------------------------
-    openings = re.search(r"(\d+)\s+(openings|positions|vacancies)", text, re.I)
+    openings = re.search(
+        r"\b\d+\s+(?:openings?|positions?|vacancies?|roles?|seats?)\b",
+        text,
+        re.I
+    )
     if openings:
-        data["openings"] = openings.group(1)
+        data["openings"] = openings.group(0).split()[0]
 
     # -------------------------
     # LOCATION (spaCy NER)
@@ -121,46 +142,95 @@ def extract_structured_jd(text):
     # -------------------------
     # DESIGNATION (Heuristic)
     # -------------------------
+    designation_keywords = [
+        r"intern",
+        r"engineer",
+        r"developer",
+        r"manager",
+        r"analyst",
+        r"consultant",
+        r"associate",
+        r"specialist",
+        r"executive",
+        r"trainee",
+        r"designer",
+        r"architect",
+        r"scientist",
+        r"officer",
+        r"coordinator",
+        r"lead",
+        r"head",
+        r"director",
+    ]
     for line in text.splitlines():
-        match = re.search(r"(intern|engineer|developer|manager|analyst|consultant)", line, re.I)
-        if match:
-            designation = re.sub(r"(?i)Designation\s*[:\-]?\s*", "", line).strip()
+        line_lower = line.lower()
+        if any(keyword in line_lower for keyword in designation_keywords):
+            designation = re.sub(r"(?i)(?:designation|role|position|title)\s*[:\-]?\s*", "", line).strip()
             data["designation"] = designation
             break
 
     # -------------------------
     # EDUCATION / EXPERIENCE
     # -------------------------
-    education = re.search(r"(B\.?Tech|M\.?Tech|Bachelor|Master|Degree)", text, re.I)
+    education = re.search(
+        r"(?:B\.?\s?Tech|M\.?\s?Tech|Bachelor|Master|Degree|Diploma|Ph\.?D|MBA|B\.?Sc|M\.?Sc|B\.?E|M\.?E|B\.?A|M\.?A|B\.?Com|M\.?Com|B\.?BA|M\.?BA|B\.?CA|M\.?CA|B\.?Arch|M\.?Arch)",
+        text,
+        re.I
+    )
     if education:
         data["preferred_education"] = education.group(0)
 
-    experience = re.search(r"\d+\+?\s+years?\s+experience", text, re.I)
+    experience = re.search(
+        r"\b\d+\+?\s?(?:-|to|–)\s?\d+\+?\s+years?\s+experience\b|\b\d+\+?\s+years?\s+experience\b",
+        text,
+        re.I
+    )
     if experience:
         data["desired_experience"] = experience.group(0)
+
+    # -------------------------
+    # JOINING MONTH
+    # -------------------------
+    joining_month = re.search(
+        r"(?:joining|start|commence|begin)\s+(?:in|by|on)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{4}",
+        text,
+        re.I
+    )
+    if joining_month:
+        data["joining_month"] = joining_month.group(0)
 
     # -------------------------
     # SECTION EXTRACTION
     # -------------------------
     def extract_section(header_keywords):
-        pattern = r"(?i)(" + "|".join(header_keywords) + r")\s*[:\-]?\s*(.*?)(?=\n[A-Z][^\n]{0,40}:|\Z)"
+        pattern = r"(?i)(?:{})\s*[:\-]?\s*(.*?)(?=\n(?:\d+\.|[A-Z][^\n]{0,40}:|\Z))".format("|".join(header_keywords))
         match = re.search(pattern, text, re.S)
-        return match.group(2).strip() if match else ""
+        return match.group(1).strip() if match else ""
 
     data["roles_responsibilities"] = extract_section(
-        ["Roles", "Responsibilities", "What you will do"]
+        ["Roles", "Responsibilities", "What you will do", "Job Description", "Key Responsibilities"]
     )
 
     data["skills"] = extract_section(
-        ["Skills", "Requirements", "Qualifications"]
+        ["Skills", "Requirements", "Qualifications", "Technical Skills", "Soft Skills", "Must Have", "Good to Have"]
     )
 
     data["selection_process"] = extract_section(
-        ["Selection Process", "Interview Process", "Hiring Process"]
+        ["Selection Process", "Interview Process", "Hiring Process", "Recruitment Process", "How to Apply"]
     )
 
-    return data
+    # -------------------------
+    # COMPANY NAME
+    # -------------------------
+    company_name = re.search(
+        r"(?:company|organization|firm|corporation|name)\s*[:\-]?\s*([A-Z][^\n]+)",
+        text,
+        re.I
+    )
+    if company_name:
+        data["company_name"] = company_name.group(1).strip()
 
+    return data
 # =====================================================
 # PDF GENERATION WITH WRAPPING
 # =====================================================
