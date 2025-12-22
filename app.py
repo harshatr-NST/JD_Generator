@@ -170,13 +170,12 @@ def generate_template_pdf(data):
                             rightMargin=30, leftMargin=30,
                             topMargin=30, bottomMargin=30)
 
-    # Paragraph style with Arial, size 8
+    # Paragraph style (Arial, size 8, wrap text)
     style_left = ParagraphStyle(
         name='LeftCol',
         fontName='Arial',
         fontSize=8,
-        textColor=colors.white,
-        backColor=colors.HexColor("#2e74b5"),
+        textColor=colors.white,  # Text color only
         leftIndent=0,
         rightIndent=0,
         spaceAfter=2,
@@ -188,7 +187,6 @@ def generate_template_pdf(data):
         fontName='Arial',
         fontSize=8,
         textColor=colors.black,
-        backColor=colors.white,
         leftIndent=0,
         rightIndent=0,
         spaceAfter=2,
@@ -205,18 +203,35 @@ def generate_template_pdf(data):
         ])
 
     table = Table(table_data, colWidths=[170, 330], repeatRows=0)
-    table.setStyle(TableStyle([
+    
+    table_style = TableStyle([
+        # Table border
         ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#a3a3a3")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 6),
         ("RIGHTPADDING", (0, 0), (-1, -1), 6),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-    ]))
+        
+        # Column 1 cell background (fills entire cell)
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#2e74b5")),
+        ("TEXTCOLOR", (0, 0), (0, -1), colors.white),
+        ("FONTNAME", (0, 0), (0, -1), "Arial"),
+        ("FONTSIZE", (0, 0), (0, -1), 8),
+        
+        # Column 2 cell background
+        ("BACKGROUND", (1, 0), (1, -1), colors.white),
+        ("TEXTCOLOR", (1, 0), (1, -1), colors.black),
+        ("FONTNAME", (1, 0), (1, -1), "Arial"),
+        ("FONTSIZE", (1, 0), (1, -1), 8),
+    ])
+
+    table.setStyle(table_style)
 
     doc.build([table])
     buffer.seek(0)
     return buffer
+
 
 # =====================================================
 # STREAMLIT UI
