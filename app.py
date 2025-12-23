@@ -3,9 +3,9 @@ import pdfplumber
 import docx
 import re
 import io
+import json
 
-import spacy
-from transformers import pipeline
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from reportlab.lib.styles import ParagraphStyle
@@ -19,23 +19,19 @@ from reportlab.pdfbase import pdfmetrics
 # =====================================================
 st.set_page_config(page_title="JD Generator", layout="wide")
 
-nlp = spacy.blank("en")
-
-# Register Arial font (ensure Arial.ttf is in repo root)
+# Register font (place Arial.ttf in repo root)
 pdfmetrics.registerFont(TTFont("Arial", "Arial.ttf"))
 
 # =====================================================
-# LOAD HUGGINGFACE MODEL (CACHED)
+# LOAD SMALL LOCAL LLM (NO API)
 # =====================================================
 @st.cache_resource
-def load_ner_model():
-    return pipeline(
-        "ner",
-        model="dslim/bert-base-NER",
-        aggregation_strategy="simple"
-    )
+def load_llm():
+    tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
+    model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
+    return tokenizer, model
 
-ner_pipeline = load_ner_model()
+tokenizer, llm_model = load_llm()
 
 # =====================================================
 # TEMPLATE DEFINITION
@@ -90,133 +86,60 @@ def extract_text_from_docx(file):
     return "\n".join(p.text for p in doc.paragraphs)
 
 # =====================================================
-# IMPROVED EXTRACTION (TRANSFORMER + REGEX)
+# LLM-BASED JD UNDERSTANDING
 # =====================================================
-def extract_structured_jd(text):
-    data = {v: "" for v in FIELD_KEYS.values()}
+def extract_structured_jd_llm(text):
+    prompt = f"""
+You are an HR assistant.
 
-    # -------------------------
-    # Transformer NER
-    # -------------------------
-    ner_results = ner_pipeline(text)
+Extract the following fields from the job description.
+If a field is missing, return an empty string.
 
-    orgs, locs = [], []
+Return ONLY valid JSON with these keys:
+company_name
+official_website
+preferred_education
+desired_experience
+designation
+stipend
+stipend_part_time
+internship_duration
+roles_responsibilities
+skills
+joining_location
+joining_month
+openings
+selection_process
 
-    for ent in ner_results:
-        if ent["entity_group"] == "ORG":
-            orgs.append(ent["word"])
-        elif ent["entity_group"] == "LOC":
-            locs.append(ent["word"])
+Job Description:
+{text}
+"""
 
-    if orgs:
-        data["company_name"] = orgs[0]
-
-    if locs:
-        data["joining_location"] = locs[0]
-
-    # -------------------------
-    # Designation (Hybrid)
-    # -------------------------
-    designation_keywords = [
-        "intern", "engineer", "developer", "manager", "analyst",
-        "consultant", "designer", "architect", "scientist",
-        "associate", "executive", "lead", "head"
-    ]
-
-    for line in text.splitlines():
-        if any(k in line.lower() for k in designation_keywords):
-            data["designation"] = line.strip()
-            break
-
-    # -------------------------
-    # Website
-    # -------------------------
-    website = re.search(r"(https?://[^\s]+|www\.[^\s]+)", text)
-    if website:
-        data["official_website"] = website.group(0)
-
-    # -------------------------
-    # Stipend
-    # -------------------------
-    stipend = re.search(
-        r"(₹|\$)?\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\s?(?:-|to|–)\s?(₹|\$)?\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\s?(?:per month|pm|monthly|/month|/mo)?",
-        text,
-        re.I
-    )
-    if stipend:
-        data["stipend"] = stipend.group(0)
-
-    # -------------------------
-    # Duration
-    # -------------------------
-    duration = re.search(
-        r"\b\d+\s?(?:months?|weeks?|days?)\b",
-        text,
-        re.I
-    )
-    if duration:
-        data["internship_duration"] = duration.group(0)
-
-    # -------------------------
-    # Openings
-    # -------------------------
-    openings = re.search(
-        r"\b(\d+)\s+(openings?|positions?|vacancies?)\b",
-        text,
-        re.I
-    )
-    if openings:
-        data["openings"] = openings.group(1)
-
-    # -------------------------
-    # Education
-    # -------------------------
-    education = re.search(
-        r"(B\.?\s?Tech|M\.?\s?Tech|Bachelor|Master|MBA|Ph\.?D|Degree|Diploma)",
-        text,
-        re.I
-    )
-    if education:
-        data["preferred_education"] = education.group(0)
-
-    # -------------------------
-    # Experience
-    # -------------------------
-    experience = re.search(
-        r"\b\d+\+?\s+years?\s+experience\b",
-        text,
-        re.I
-    )
-    if experience:
-        data["desired_experience"] = experience.group(0)
-
-    # -------------------------
-    # Section Extraction
-    # -------------------------
-    def extract_section(headers):
-        header_pattern = "|".join([re.escape(h) for h in headers])
-        pattern = (
-            r"(?i)(?:{headers})\s*[:\-]?\s*(.*?)"
-            r"(?=\n[A-Z][^\n]{{0,40}}:|\Z)"
-        ).format(headers=header_pattern)
-
-        match = re.search(pattern, text, re.S)
-        return match.group(1).strip() if match else ""
-
-
-    data["roles_responsibilities"] = extract_section(
-        ["Roles", "Responsibilities", "What you will do", "Job Description"]
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048
     )
 
-    data["skills"] = extract_section(
-        ["Skills", "Requirements", "Qualifications", "Technical Skills", "Must Have"]
+    outputs = llm_model.generate(
+        **inputs,
+        max_new_tokens=512,
+        temperature=0.0
     )
 
-    data["selection_process"] = extract_section(
-        ["Selection Process", "Interview Process", "Hiring Process"]
-    )
+    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-    return data
+    try:
+        parsed = json.loads(decoded)
+    except json.JSONDecodeError:
+        parsed = {v: "" for v in FIELD_KEYS.values()}
+
+    # Ensure all keys exist
+    for key in FIELD_KEYS.values():
+        parsed.setdefault(key, "")
+
+    return parsed
 
 # =====================================================
 # PDF GENERATION (WRAPPED TEXT)
@@ -233,14 +156,14 @@ def generate_template_pdf(data):
     )
 
     style_left = ParagraphStyle(
-        name="Left",
+        name="LeftCol",
         fontName="Arial",
         fontSize=8,
         textColor=colors.white
     )
 
     style_right = ParagraphStyle(
-        name="Right",
+        name="RightCol",
         fontName="Arial",
         fontSize=8,
         textColor=colors.black
@@ -274,10 +197,10 @@ def generate_template_pdf(data):
 # =====================================================
 # STREAMLIT UI
 # =====================================================
-st.title("JD Generator")
+st.title("JD Generator (AI-powered)")
 
 uploaded_file = st.file_uploader(
-    "Upload Job Description (TXT, PDF, DOCX)",
+    "Upload Job Description (PDF, DOCX, TXT)",
     type=["txt", "pdf", "docx"]
 )
 
@@ -291,15 +214,15 @@ if uploaded_file:
     elif uploaded_file.type.endswith("wordprocessingml.document"):
         raw_text = extract_text_from_docx(uploaded_file)
 
-    st.subheader("Extracted Raw Text")
-    st.text_area("", raw_text, height=250)
+    if st.button("Extract & Fill Template"):
+        with st.spinner("Understanding job description using AI..."):
+            st.session_state["jd_data"] = extract_structured_jd_llm(raw_text)
 
-    if st.button("Extract to Template"):
-        with st.spinner("Extracting using AI model..."):
-            st.session_state["jd_data"] = extract_structured_jd(raw_text)
-
+# =====================================================
+# EDITABLE TEMPLATE (NO RAW TEXT SHOWN)
+# =====================================================
 if "jd_data" in st.session_state:
-    st.subheader("Editable Standard Template")
+    st.subheader("Review & Edit Extracted Information")
 
     edited_data = {}
 
@@ -324,7 +247,7 @@ if "jd_data" in st.session_state:
     pdf_filename = f"{company_name}-{designation}.pdf"
 
     st.download_button(
-        "Download Completed Template (PDF)",
+        "Download Completed JD (PDF)",
         pdf_file,
         pdf_filename,
         "application/pdf"
