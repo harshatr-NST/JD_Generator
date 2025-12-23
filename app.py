@@ -5,10 +5,10 @@ import re
 import io
 
 import spacy
-from spacy.matcher import Matcher, PhraseMatcher
+from transformers import pipeline
 
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.pdfbase.ttfonts import TTFont
@@ -21,8 +21,21 @@ st.set_page_config(page_title="JD Generator", layout="wide")
 
 nlp = spacy.blank("en")
 
-# Register Arial font (ensure arial.ttf is available in your system)
+# Register Arial font (ensure Arial.ttf is in repo root)
 pdfmetrics.registerFont(TTFont("Arial", "Arial.ttf"))
+
+# =====================================================
+# LOAD HUGGINGFACE MODEL (CACHED)
+# =====================================================
+@st.cache_resource
+def load_ner_model():
+    return pipeline(
+        "ner",
+        model="dslim/bert-base-NER",
+        aggregation_strategy="simple"
+    )
+
+ner_pipeline = load_ner_model()
 
 # =====================================================
 # TEMPLATE DEFINITION
@@ -77,82 +90,122 @@ def extract_text_from_docx(file):
     return "\n".join(p.text for p in doc.paragraphs)
 
 # =====================================================
-# RULE-BASED NLP EXTRACTION
+# IMPROVED EXTRACTION (TRANSFORMER + REGEX)
 # =====================================================
 def extract_structured_jd(text):
     data = {v: "" for v in FIELD_KEYS.values()}
-    doc = nlp(text)
 
     # -------------------------
-    # WEBSITE
+    # Transformer NER
     # -------------------------
-    website = re.search(r"(https?://\S+)", text)
+    ner_results = ner_pipeline(text)
+
+    orgs, locs = [], []
+
+    for ent in ner_results:
+        if ent["entity_group"] == "ORG":
+            orgs.append(ent["word"])
+        elif ent["entity_group"] == "LOC":
+            locs.append(ent["word"])
+
+    if orgs:
+        data["company_name"] = orgs[0]
+
+    if locs:
+        data["joining_location"] = locs[0]
+
+    # -------------------------
+    # Designation (Hybrid)
+    # -------------------------
+    designation_keywords = [
+        "intern", "engineer", "developer", "manager", "analyst",
+        "consultant", "designer", "architect", "scientist",
+        "associate", "executive", "lead", "head"
+    ]
+
+    for line in text.splitlines():
+        if any(k in line.lower() for k in designation_keywords):
+            data["designation"] = line.strip()
+            break
+
+    # -------------------------
+    # Website
+    # -------------------------
+    website = re.search(r"(https?://[^\s]+|www\.[^\s]+)", text)
     if website:
-        data["official_website"] = website.group(1)
+        data["official_website"] = website.group(0)
 
     # -------------------------
-    # STIPEND / SALARY
+    # Stipend
     # -------------------------
-    stipend = re.search(r"(₹|\$)?\s?\d{3,6}\s?[-to]+\s?(₹|\$)?\s?\d{3,6}", text)
+    stipend = re.search(
+        r"(₹|\$)?\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\s?(?:-|to|–)\s?(₹|\$)?\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\s?(?:per month|pm|monthly|/month|/mo)?",
+        text,
+        re.I
+    )
     if stipend:
         data["stipend"] = stipend.group(0)
 
     # -------------------------
-    # DURATION
+    # Duration
     # -------------------------
-    duration = re.search(r"\d+\s?(months|month|weeks|week)", text, re.I)
+    duration = re.search(
+        r"\b\d+\s?(?:months?|weeks?|days?)\b",
+        text,
+        re.I
+    )
     if duration:
         data["internship_duration"] = duration.group(0)
 
     # -------------------------
-    # OPENINGS
+    # Openings
     # -------------------------
-    openings = re.search(r"(\d+)\s+(openings|positions|vacancies)", text, re.I)
+    openings = re.search(
+        r"\b(\d+)\s+(openings?|positions?|vacancies?)\b",
+        text,
+        re.I
+    )
     if openings:
         data["openings"] = openings.group(1)
 
     # -------------------------
-    # LOCATION (spaCy NER)
+    # Education
     # -------------------------
-    locations = [ent.text for ent in doc.ents if ent.label_ == "GPE"]
-    if locations:
-        data["joining_location"] = locations[0]
-
-    # -------------------------
-    # DESIGNATION (Heuristic)
-    # -------------------------
-    for line in text.splitlines():
-        match = re.search(r"(intern|engineer|developer|manager|analyst|consultant)", line, re.I)
-        if match:
-            designation = re.sub(r"(?i)Designation\s*[:\-]?\s*", "", line).strip()
-            data["designation"] = designation
-            break
-
-    # -------------------------
-    # EDUCATION / EXPERIENCE
-    # -------------------------
-    education = re.search(r"(B\.?Tech|M\.?Tech|Bachelor|Master|Degree)", text, re.I)
+    education = re.search(
+        r"(B\.?\s?Tech|M\.?\s?Tech|Bachelor|Master|MBA|Ph\.?D|Degree|Diploma)",
+        text,
+        re.I
+    )
     if education:
         data["preferred_education"] = education.group(0)
 
-    experience = re.search(r"\d+\+?\s+years?\s+experience", text, re.I)
+    # -------------------------
+    # Experience
+    # -------------------------
+    experience = re.search(
+        r"\b\d+\+?\s+years?\s+experience\b",
+        text,
+        re.I
+    )
     if experience:
         data["desired_experience"] = experience.group(0)
 
     # -------------------------
-    # SECTION EXTRACTION
+    # Section Extraction
     # -------------------------
-    def extract_section(header_keywords):
-        pattern = r"(?i)(" + "|".join(header_keywords) + r")\s*[:\-]?\s*(.*?)(?=\n[A-Z][^\n]{0,40}:|\Z)"
+    def extract_section(headers):
+        pattern = r"(?i)(?:{})\s*[:\-]?\s*(.*?)(?=\n[A-Z][^\n]{0,40}:|\Z)".format(
+            "|".join(headers)
+        )
         match = re.search(pattern, text, re.S)
-        return match.group(2).strip() if match else ""
+        return match.group(1).strip() if match else ""
 
     data["roles_responsibilities"] = extract_section(
-        ["Roles", "Responsibilities", "What you will do"]
+        ["Roles", "Responsibilities", "What you will do", "Job Description"]
     )
 
     data["skills"] = extract_section(
-        ["Skills", "Requirements", "Qualifications"]
+        ["Skills", "Requirements", "Qualifications", "Technical Skills", "Must Have"]
     )
 
     data["selection_process"] = extract_section(
@@ -162,35 +215,31 @@ def extract_structured_jd(text):
     return data
 
 # =====================================================
-# PDF GENERATION WITH WRAPPING
+# PDF GENERATION (WRAPPED TEXT)
 # =====================================================
 def generate_template_pdf(data):
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4,
-                            rightMargin=30, leftMargin=30,
-                            topMargin=30, bottomMargin=30)
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=30,
+        leftMargin=30,
+        topMargin=30,
+        bottomMargin=30
+    )
 
-    # Paragraph style (Arial, size 8, wrap text)
     style_left = ParagraphStyle(
-        name='LeftCol',
-        fontName='Arial',
+        name="Left",
+        fontName="Arial",
         fontSize=8,
-        textColor=colors.white,  # Text color only
-        leftIndent=0,
-        rightIndent=0,
-        spaceAfter=2,
-        spaceBefore=2
+        textColor=colors.white
     )
 
     style_right = ParagraphStyle(
-        name='RightCol',
-        fontName='Arial',
+        name="Right",
+        fontName="Arial",
         fontSize=8,
-        textColor=colors.black,
-        leftIndent=0,
-        rightIndent=0,
-        spaceAfter=2,
-        spaceBefore=2
+        textColor=colors.black
     )
 
     table_data = []
@@ -202,31 +251,17 @@ def generate_template_pdf(data):
             Paragraph(data.get(key, "").replace("\n", "<br/>"), style_right)
         ])
 
-    table = Table(table_data, colWidths=[170, 330], repeatRows=0)
-    
-    table_style = TableStyle([
-        # Table border
+    table = Table(table_data, colWidths=[170, 330])
+
+    table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#a3a3a3")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#2e74b5")),
         ("LEFTPADDING", (0, 0), (-1, -1), 6),
         ("RIGHTPADDING", (0, 0), (-1, -1), 6),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        
-        # Column 1 cell background (fills entire cell)
-        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#2e74b5")),
-        ("TEXTCOLOR", (0, 0), (0, -1), colors.white),
-        ("FONTNAME", (0, 0), (0, -1), "Arial"),
-        ("FONTSIZE", (0, 0), (0, -1), 8),
-        
-        # Column 2 cell background
-        ("BACKGROUND", (1, 0), (1, -1), colors.white),
-        ("TEXTCOLOR", (1, 0), (1, -1), colors.black),
-        ("FONTNAME", (1, 0), (1, -1), "Arial"),
-        ("FONTSIZE", (1, 0), (1, -1), 8),
-    ])
-
-    table.setStyle(table_style)
+    ]))
 
     doc.build([table])
     buffer.seek(0)
@@ -256,7 +291,7 @@ if uploaded_file:
     st.text_area("", raw_text, height=250)
 
     if st.button("Extract to Template"):
-        with st.spinner("Extracting using NLP rules..."):
+        with st.spinner("Extracting using AI model..."):
             st.session_state["jd_data"] = extract_structured_jd(raw_text)
 
 if "jd_data" in st.session_state:
@@ -280,7 +315,6 @@ if "jd_data" in st.session_state:
 
     pdf_file = generate_template_pdf(edited_data)
 
-    # Create filename based on company name and designation
     company_name = edited_data.get("company_name", "Company").replace(" ", "_")
     designation = edited_data.get("designation", "Designation").replace(" ", "_")
     pdf_filename = f"{company_name}-{designation}.pdf"
