@@ -194,11 +194,15 @@ def extract_structured_jd(text):
     # Section Extraction
     # -------------------------
     def extract_section(headers):
-        pattern = r"(?i)(?:{})\s*[:\-]?\s*(.*?)(?=\n[A-Z][^\n]{0,40}:|\Z)".format(
-            "|".join(headers)
-        )
+        header_pattern = "|".join([re.escape(h) for h in headers])
+        pattern = (
+            r"(?i)(?:{headers})\s*[:\-]?\s*(.*?)"
+            r"(?=\n[A-Z][^\n]{{0,40}}:|\Z)"
+        ).format(headers=header_pattern)
+
         match = re.search(pattern, text, re.S)
         return match.group(1).strip() if match else ""
+
 
     data["roles_responsibilities"] = extract_section(
         ["Roles", "Responsibilities", "What you will do", "Job Description"]
