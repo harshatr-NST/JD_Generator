@@ -1,8 +1,11 @@
 import streamlit as st
 import pdfplumber
 import docx
+import pytesseract
+from PIL import Image
 import re
 import io
+import json
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
@@ -10,34 +13,14 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.pdfbase import pdfmetrics
 
 # =====================================================
-# CONFIG
+# STREAMLIT CONFIG
 # =====================================================
 st.set_page_config(page_title="JD Generator", layout="wide")
 
-# Font (safe fallback)
-try:
-    pdfmetrics.registerFont(TTFont("Arial", "Arial.ttf"))
-    FONT = "Arial"
-except:
-    FONT = "Helvetica"
-
 # =====================================================
-# LOAD LOCAL LLM (SECTION EXTRACTION ONLY)
-# =====================================================
-@st.cache_resource
-def load_llm():
-    tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
-    model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
-    return tokenizer, model
-
-tokenizer, llm_model = load_llm()
-
-# =====================================================
-# TEMPLATE DEFINITION
+# TEMPLATE DEFINITIONS
 # =====================================================
 TEMPLATE_FIELDS = [
     "Company Name",
@@ -53,7 +36,7 @@ TEMPLATE_FIELDS = [
     "Joining Location",
     "Joining Month",
     "No. of openings",
-    "Selection Process"
+    "Selection Process",
 ]
 
 FIELD_KEYS = {
@@ -70,219 +53,269 @@ FIELD_KEYS = {
     "Joining Location": "joining_location",
     "Joining Month": "joining_month",
     "No. of openings": "openings",
-    "Selection Process": "selection_process"
+    "Selection Process": "selection_process",
 }
 
+EMPTY_SCHEMA = {v: "" for v in FIELD_KEYS.values()}
+
 # =====================================================
-# FILE TEXT EXTRACTION
+# LOAD LOCAL OPEN-SOURCE LLM (COMPLETION ONLY)
 # =====================================================
-def extract_text_from_pdf(file):
+@st.cache_resource
+def load_llm():
+    tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
+    model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
+    return tokenizer, model
+
+tokenizer, llm_model = load_llm()
+
+# =====================================================
+# OCR + TEXT EXTRACTION
+# =====================================================
+def extract_text(file):
     text = ""
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            if page.extract_text():
-                text += page.extract_text() + "\n"
-    return text
 
+    if file.type == "application/pdf":
+        with pdfplumber.open(file) as pdf:
+            for page in pdf.pages:
+                extracted = page.extract_text()
+                if extracted and len(extracted.strip()) > 100:
+                    text += extracted + "\n"
+                else:
+                    image = page.to_image(resolution=300).original
+                    ocr_text = pytesseract.image_to_string(
+                        image, config="--psm 6"
+                    )
+                    text += ocr_text + "\n"
 
-def extract_text_from_docx(file):
-    doc = docx.Document(file)
-    return "\n".join(p.text for p in doc.paragraphs)
+    elif file.type.endswith("wordprocessingml.document"):
+        doc = docx.Document(file)
+        text = "\n".join(p.text for p in doc.paragraphs)
 
+    elif file.type == "text/plain":
+        text = file.read().decode("utf-8")
+
+    return re.sub(r"\n{2,}", "\n", text).strip()
 
 # =====================================================
-# RULE-BASED EXTRACTION (DETERMINISTIC)
+# RULE-BASED EXTRACTION (PRIMARY)
 # =====================================================
-def extract_with_rules(text):
-    data = {v: "" for v in FIELD_KEYS.values()}
+def rule_extract(text):
+    data = EMPTY_SCHEMA.copy()
+    sections = {}
+    current = None
 
-    # Website
-    m = re.search(r"https?://\S+", text)
-    if m:
-        data["official_website"] = m.group(0)
-
-    # Designation
     for line in text.splitlines():
-        if re.search(r"(intern|engineer|developer|manager|analyst)", line, re.I):
-            data["designation"] = line.strip()
-            break
+        l = line.strip()
+        if not l:
+            continue
 
-    # Internship duration
-    m = re.search(r"\d+\s*(months?|weeks?)", text, re.I)
-    if m:
-        data["internship_duration"] = m.group(0)
+        if re.search(r"(role|responsibilit)", l, re.I):
+            current = "roles_responsibilities"
+            sections[current] = ""
+        elif re.search(r"(skill|qualification|requirement)", l, re.I):
+            current = "skills"
+            sections[current] = ""
+        elif re.search(r"(selection|interview|process)", l, re.I):
+            current = "selection_process"
+            sections[current] = ""
+        elif current:
+            sections[current] += l + "\n"
 
-    # Openings
-    m = re.search(r"(\d+)\s+(openings|positions|vacancies)", text, re.I)
-    if m:
-        data["openings"] = m.group(1)
+    data.update(sections)
 
-    # Stipend / salary
-    m = re.search(r"(₹|\$)\s?\d+[,\d]*", text)
-    if m:
-        data["stipend"] = m.group(0)
+    if m := re.search(r"(job title|designation|role)\s*[:\-]\s*(.*)", text, re.I):
+        data["designation"] = m.group(2).strip()
 
-    # Education
-    m = re.search(r"(B\.?Tech|M\.?Tech|Bachelor|Master|Degree)", text, re.I)
-    if m:
-        data["preferred_education"] = m.group(0)
-
-    # Experience
-    m = re.search(r"\d+\+?\s+years?\s+experience", text, re.I)
-    if m:
+    if m := re.search(r"\d+\+?\s*years?", text, re.I):
         data["desired_experience"] = m.group(0)
 
-    # Location (simple heuristic)
-    for line in text.splitlines():
-        if "location" in line.lower():
-            data["joining_location"] = line.split(":")[-1].strip()
-            break
+    if m := re.search(r"(₹|\$)\s?\d+[,\d]*", text):
+        data["stipend"] = m.group(0)
+
+    if m := re.search(r"\d+\s*(months?|weeks?)", text, re.I):
+        data["internship_duration"] = m.group(0)
+
+    if m := re.search(r"\d+\s+(openings|positions|vacancies)", text, re.I):
+        data["openings"] = m.group(0)
+
+    if m := re.search(r"(location|based at)\s*[:\-]?\s*(.*)", text, re.I):
+        data["joining_location"] = m.group(2)
 
     return data
 
+# =====================================================
+# SKILL NORMALIZATION
+# =====================================================
+SKILL_MAP = {
+    "Python": ["python", "py"],
+    "Java": ["java", "java se", "java 8"],
+    "SQL": ["sql", "mysql", "postgres"],
+    "Machine Learning": ["machine learning", "ml"],
+    "Data Analysis": ["data analysis", "analytics"],
+}
+
+def normalize_skills(text):
+    found = set()
+    lower = text.lower()
+    for canon, variants in SKILL_MAP.items():
+        for v in variants:
+            if v in lower:
+                found.add(canon)
+    return ", ".join(sorted(found))
 
 # =====================================================
-# LLM SECTION EXTRACTION (NO JSON)
+# LLM FILL ONLY BLANK FIELDS
 # =====================================================
-def extract_section_llm(text, section_name):
+def llm_fill_missing(raw_text, data):
+    missing = [k for k, v in data.items() if not v.strip()]
+    if not missing:
+        return data
+
     prompt = f"""
-Extract ONLY the {section_name} from the job description.
-Return plain text only. No explanation.
+Fill ONLY the missing fields below.
+Do not modify existing values.
+Return ONLY valid JSON.
+
+Missing fields:
+{missing}
 
 Job Description:
-{text}
+{raw_text}
+
+Current data:
+{json.dumps(data)}
 """
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
-    outputs = llm_model.generate(**inputs, max_new_tokens=256)
-    return tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    outputs = llm_model.generate(**inputs, max_new_tokens=512)
+    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-def extract_sections_with_llm(text):
-    return {
-        "roles_responsibilities": extract_section_llm(text, "Roles & Responsibilities"),
-        "skills": extract_section_llm(text, "Skills / Requirements"),
-        "selection_process": extract_section_llm(text, "Selection Process"),
-    }
+    try:
+        filled = json.loads(decoded)
+        for k in missing:
+            if k in filled and filled[k]:
+                data[k] = filled[k]
+    except:
+        pass
 
-
-# =====================================================
-# HYBRID EXTRACTION (FINAL)
-# =====================================================
-def extract_structured_jd(text):
-    data = extract_with_rules(text)
-    llm_sections = extract_sections_with_llm(text)
-    data.update(llm_sections)
     return data
 
+# =====================================================
+# CONFIDENCE SCORING
+# =====================================================
+def confidence_score(value):
+    if not value:
+        return 0.0
+    if len(value.split()) > 20:
+        return 0.9
+    if len(value.split()) > 5:
+        return 0.7
+    return 0.5
 
 # =====================================================
 # PDF GENERATION
 # =====================================================
-def generate_template_pdf(data):
+def generate_pdf(data):
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=30,
-        leftMargin=30,
-        topMargin=30,
-        bottomMargin=30
-    )
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
 
-    style_left = ParagraphStyle(
-        name="Left",
-        fontName=FONT,
-        fontSize=8,
-        textColor=colors.white
-    )
-
-    style_right = ParagraphStyle(
-        name="Right",
-        fontName=FONT,
-        fontSize=8,
-        textColor=colors.black
-    )
+    left = ParagraphStyle("left", fontSize=8, textColor=colors.white)
+    right = ParagraphStyle("right", fontSize=8)
 
     table_data = []
 
     for label in TEMPLATE_FIELDS:
         key = FIELD_KEYS[label]
         table_data.append([
-            Paragraph(label, style_left),
-            Paragraph(data.get(key, "").replace("\n", "<br/>"), style_right)
+            Paragraph(label, left),
+            Paragraph(data.get(key, "").replace("\n", "<br/>"), right)
         ])
 
-    table = Table(table_data, colWidths=[170, 330])
+    table = Table(table_data, colWidths=[170, 340])
     table.setStyle(TableStyle([
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#a3a3a3")),
-        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#2e74b5")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+        ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#2e74b5")),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("PADDING", (0,0), (-1,-1), 6),
     ]))
 
     doc.build([table])
     buffer.seek(0)
     return buffer
 
+# =====================================================
+# DOCX GENERATION
+# =====================================================
+def generate_docx(data):
+    document = docx.Document()
+    style = document.styles["Normal"]
+    style.font.name = "Arial"
+    style.font.size = docx.shared.Pt(10)
+
+    for label in TEMPLATE_FIELDS:
+        key = FIELD_KEYS[label]
+        p = document.add_paragraph()
+        run = p.add_run(f"{label}:\n")
+        run.bold = True
+        document.add_paragraph(data.get(key, ""))
+
+    buf = io.BytesIO()
+    document.save(buf)
+    buf.seek(0)
+    return buf
 
 # =====================================================
 # STREAMLIT UI
 # =====================================================
-st.title("JD Generator (Hybrid AI + Rules)")
+st.title("JD Generator (OCR + AI Assisted)")
 
 uploaded_file = st.file_uploader(
-    "Upload Job Description (PDF, DOCX, TXT)",
-    type=["txt", "pdf", "docx"]
+    "Upload Job Description (PDF / DOCX / TXT)",
+    type=["pdf", "docx", "txt"]
 )
 
-raw_text = ""
-
 if uploaded_file:
-    if uploaded_file.type == "text/plain":
-        raw_text = uploaded_file.read().decode("utf-8")
-    elif uploaded_file.type == "application/pdf":
-        raw_text = extract_text_from_pdf(uploaded_file)
-    elif uploaded_file.type.endswith("wordprocessingml.document"):
-        raw_text = extract_text_from_docx(uploaded_file)
+    raw_text = extract_text(uploaded_file)
 
-    if st.button("Extract & Fill Template"):
-        with st.spinner("Extracting job information..."):
-            st.session_state["jd_data"] = extract_structured_jd(raw_text)
+    st.subheader("OCR / Extracted Text")
+    st.text_area("Extracted Content", raw_text, height=250)
 
+    if st.button("Extract & Auto-Fill"):
+        base = rule_extract(raw_text)
+        final = llm_fill_missing(raw_text, base)
 
-# =====================================================
-# EDITABLE TEMPLATE
-# =====================================================
-if "jd_data" in st.session_state:
-    st.subheader("Review & Edit Extracted Information")
+        if final.get("skills"):
+            final["skills"] = normalize_skills(final["skills"])
 
-    edited_data = {}
+        st.session_state["data"] = final
+        st.session_state["confidence"] = {
+            k: confidence_score(v) for k, v in final.items()
+        }
 
+if "data" in st.session_state:
+    st.subheader("Review & Edit")
+
+    edited = {}
     for label in TEMPLATE_FIELDS:
         key = FIELD_KEYS[label]
         if label in ["Roles & Responsibilities", "Skills", "Selection Process"]:
-            edited_data[key] = st.text_area(
-                label,
-                st.session_state["jd_data"].get(key, ""),
-                height=120
-            )
+            edited[key] = st.text_area(label, st.session_state["data"].get(key, ""), height=120)
         else:
-            edited_data[key] = st.text_input(
-                label,
-                st.session_state["jd_data"].get(key, "")
-            )
+            edited[key] = st.text_input(label, st.session_state["data"].get(key, ""))
 
-    pdf_file = generate_template_pdf(edited_data)
+        st.caption(f"Confidence: {int(st.session_state['confidence'][key]*100)}%")
 
-    company = edited_data.get("company_name", "Company").replace(" ", "_")
-    role = edited_data.get("designation", "Role").replace(" ", "_")
+    pdf = generate_pdf(edited)
+    docx_file = generate_docx(edited)
 
+    company = edited.get("company_name", "Company").replace(" ", "_")
+    role = edited.get("designation", "Role").replace(" ", "_")
+
+    st.download_button("Download PDF", pdf, f"{company}-{role}.pdf", "application/pdf")
     st.download_button(
-        "Download Completed JD (PDF)",
-        pdf_file,
-        f"{company}-{role}.pdf",
-        "application/pdf"
+        "Download DOCX",
+        docx_file,
+        f"{company}-{role}.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
