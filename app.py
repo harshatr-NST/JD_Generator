@@ -3,7 +3,6 @@ import pdfplumber
 import docx
 import re
 import io
-import json
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
@@ -19,11 +18,15 @@ from reportlab.pdfbase import pdfmetrics
 # =====================================================
 st.set_page_config(page_title="JD Generator", layout="wide")
 
-# Register font (place Arial.ttf in repo root)
-pdfmetrics.registerFont(TTFont("Arial", "Arial.ttf"))
+# Font (safe fallback)
+try:
+    pdfmetrics.registerFont(TTFont("Arial", "Arial.ttf"))
+    FONT = "Arial"
+except:
+    FONT = "Helvetica"
 
 # =====================================================
-# LOAD SMALL LOCAL LLM (NO API)
+# LOAD LOCAL LLM (SECTION EXTRACTION ONLY)
 # =====================================================
 @st.cache_resource
 def load_llm():
@@ -81,68 +84,99 @@ def extract_text_from_pdf(file):
                 text += page.extract_text() + "\n"
     return text
 
+
 def extract_text_from_docx(file):
     doc = docx.Document(file)
     return "\n".join(p.text for p in doc.paragraphs)
 
+
 # =====================================================
-# LLM-BASED JD UNDERSTANDING
+# RULE-BASED EXTRACTION (DETERMINISTIC)
 # =====================================================
-def extract_structured_jd_llm(text):
+def extract_with_rules(text):
+    data = {v: "" for v in FIELD_KEYS.values()}
+
+    # Website
+    m = re.search(r"https?://\S+", text)
+    if m:
+        data["official_website"] = m.group(0)
+
+    # Designation
+    for line in text.splitlines():
+        if re.search(r"(intern|engineer|developer|manager|analyst)", line, re.I):
+            data["designation"] = line.strip()
+            break
+
+    # Internship duration
+    m = re.search(r"\d+\s*(months?|weeks?)", text, re.I)
+    if m:
+        data["internship_duration"] = m.group(0)
+
+    # Openings
+    m = re.search(r"(\d+)\s+(openings|positions|vacancies)", text, re.I)
+    if m:
+        data["openings"] = m.group(1)
+
+    # Stipend / salary
+    m = re.search(r"(₹|\$)\s?\d+[,\d]*", text)
+    if m:
+        data["stipend"] = m.group(0)
+
+    # Education
+    m = re.search(r"(B\.?Tech|M\.?Tech|Bachelor|Master|Degree)", text, re.I)
+    if m:
+        data["preferred_education"] = m.group(0)
+
+    # Experience
+    m = re.search(r"\d+\+?\s+years?\s+experience", text, re.I)
+    if m:
+        data["desired_experience"] = m.group(0)
+
+    # Location (simple heuristic)
+    for line in text.splitlines():
+        if "location" in line.lower():
+            data["joining_location"] = line.split(":")[-1].strip()
+            break
+
+    return data
+
+
+# =====================================================
+# LLM SECTION EXTRACTION (NO JSON)
+# =====================================================
+def extract_section_llm(text, section_name):
     prompt = f"""
-You are an HR assistant.
-
-Extract the following fields from the job description.
-If a field is missing, return an empty string.
-
-Return ONLY valid JSON with these keys:
-company_name
-official_website
-preferred_education
-desired_experience
-designation
-stipend
-stipend_part_time
-internship_duration
-roles_responsibilities
-skills
-joining_location
-joining_month
-openings
-selection_process
+Extract ONLY the {section_name} from the job description.
+Return plain text only. No explanation.
 
 Job Description:
 {text}
 """
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+    outputs = llm_model.generate(**inputs, max_new_tokens=256)
+    return tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=2048
-    )
 
-    outputs = llm_model.generate(
-        **inputs,
-        max_new_tokens=512,
-        temperature=0.0
-    )
+def extract_sections_with_llm(text):
+    return {
+        "roles_responsibilities": extract_section_llm(text, "Roles & Responsibilities"),
+        "skills": extract_section_llm(text, "Skills / Requirements"),
+        "selection_process": extract_section_llm(text, "Selection Process"),
+    }
 
-    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-    try:
-        parsed = json.loads(decoded)
-    except json.JSONDecodeError:
-        parsed = {v: "" for v in FIELD_KEYS.values()}
-
-    # Ensure all keys exist
-    for key in FIELD_KEYS.values():
-        parsed.setdefault(key, "")
-
-    return parsed
 
 # =====================================================
-# PDF GENERATION (WRAPPED TEXT)
+# HYBRID EXTRACTION (FINAL)
+# =====================================================
+def extract_structured_jd(text):
+    data = extract_with_rules(text)
+    llm_sections = extract_sections_with_llm(text)
+    data.update(llm_sections)
+    return data
+
+
+# =====================================================
+# PDF GENERATION
 # =====================================================
 def generate_template_pdf(data):
     buffer = io.BytesIO()
@@ -156,15 +190,15 @@ def generate_template_pdf(data):
     )
 
     style_left = ParagraphStyle(
-        name="LeftCol",
-        fontName="Arial",
+        name="Left",
+        fontName=FONT,
         fontSize=8,
         textColor=colors.white
     )
 
     style_right = ParagraphStyle(
-        name="RightCol",
-        fontName="Arial",
+        name="Right",
+        fontName=FONT,
         fontSize=8,
         textColor=colors.black
     )
@@ -179,11 +213,10 @@ def generate_template_pdf(data):
         ])
 
     table = Table(table_data, colWidths=[170, 330])
-
     table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#a3a3a3")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#2e74b5")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 6),
         ("RIGHTPADDING", (0, 0), (-1, -1), 6),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
@@ -194,10 +227,11 @@ def generate_template_pdf(data):
     buffer.seek(0)
     return buffer
 
+
 # =====================================================
 # STREAMLIT UI
 # =====================================================
-st.title("JD Generator (AI-powered)")
+st.title("JD Generator (Hybrid AI + Rules)")
 
 uploaded_file = st.file_uploader(
     "Upload Job Description (PDF, DOCX, TXT)",
@@ -215,11 +249,12 @@ if uploaded_file:
         raw_text = extract_text_from_docx(uploaded_file)
 
     if st.button("Extract & Fill Template"):
-        with st.spinner("Understanding job description using AI..."):
-            st.session_state["jd_data"] = extract_structured_jd_llm(raw_text)
+        with st.spinner("Extracting job information..."):
+            st.session_state["jd_data"] = extract_structured_jd(raw_text)
+
 
 # =====================================================
-# EDITABLE TEMPLATE (NO RAW TEXT SHOWN)
+# EDITABLE TEMPLATE
 # =====================================================
 if "jd_data" in st.session_state:
     st.subheader("Review & Edit Extracted Information")
@@ -242,13 +277,12 @@ if "jd_data" in st.session_state:
 
     pdf_file = generate_template_pdf(edited_data)
 
-    company_name = edited_data.get("company_name", "Company").replace(" ", "_")
-    designation = edited_data.get("designation", "Designation").replace(" ", "_")
-    pdf_filename = f"{company_name}-{designation}.pdf"
+    company = edited_data.get("company_name", "Company").replace(" ", "_")
+    role = edited_data.get("designation", "Role").replace(" ", "_")
 
     st.download_button(
         "Download Completed JD (PDF)",
         pdf_file,
-        pdf_filename,
+        f"{company}-{role}.pdf",
         "application/pdf"
     )
